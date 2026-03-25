@@ -1,0 +1,693 @@
+How I Would Try To Beat The Current Best Submission
+
+Current target
+
+The current best record in this repo is:
+records/track_10min_16mb/2026-03-20_10L_Int5MLP_MuonWD04_SWA50
+
+Its reported score is:
+val_bpb = 1.14276
+
+The challenge does not accept tiny noise-level wins. A new record must beat the
+current SOTA by at least 0.005 nats and show statistical significance across
+multiple seeds. So the goal is not "find any small tweak." The goal is to find
+one or two real, robust gains that can survive quantization and still fit under
+the 16,000,000-byte artifact cap.
+
+
+What the current best already does well
+
+The current winning recipe is already stacking several strong ideas:
+
+1. 10 transformer layers at width 512
+2. 3x MLP expansion
+3. SmearGate
+4. BigramHash with 10240 buckets
+5. U-Net-style skip connections
+6. Orthogonal init
+7. Muon with weight decay
+8. SWA over the late part of training
+9. Mixed quantization:
+   - MLP weights at int5
+   - attention weights at int6
+   - a few sensitive tensors in fp16
+10. Sliding-window evaluation with stride 64
+
+This means we should not expect an easy gain from basic things like:
+
+- lowering LR a little
+- turning on sliding eval
+- widening the MLP from 2x to 3x
+- switching from zlib to zstd
+
+Those gains have already been taken.
+
+
+My main thesis
+
+If I had to bet on where the next real gain comes from, I would rank the
+opportunities like this:
+
+1. Better evaluation
+2. Better quantization/export
+3. Spending saved bytes on more model capacity
+4. Late-stage training tricks that specifically improve post-quant quality
+5. Only after those: new architecture ideas
+
+Why this order:
+
+- The leaderboard history suggests evaluation changes can be large and cheap.
+- This challenge is constrained by artifact size, so export quality matters as
+  much as raw model quality.
+- The best record is already close to the byte limit, which means any byte
+  savings can be converted directly into more useful model.
+- Radical architecture ideas are possible, but they are slower to debug and
+  more likely to fail under the 10-minute wallclock constraint.
+
+
+The most promising path
+
+My preferred attack path would be:
+
+Phase 1: Improve evaluation without changing training
+Phase 2: Improve mixed low-bit export
+Phase 3: Spend recovered bytes on 11-layer or otherwise stronger capacity
+Phase 4: Add a small amount of quantization-aware robustness only near the end
+
+This path is practical because each phase can be tested independently.
+
+
+Phase 1: Evaluation improvements
+
+Why I think this is the best first move
+
+The current best still evaluates by running sliding windows over the validation
+token stream. That is already much better than non-overlapping chunks, but it is
+probably not the final word.
+
+An older record in this repo showed:
+
+- document-isolated evaluation helped
+- stride helped more
+- lightweight LoRA test-time training helped a bit more
+
+That is important because it means evaluation is still an open surface area, not
+an exhausted one.
+
+
+1A. Document-aware sliding evaluation
+
+Goal
+
+Avoid contaminating context across document boundaries and only let each token be
+predicted using earlier tokens from the same document.
+
+Why it might win
+
+The validation set is a collection of documents, not one true continuous text.
+If the current eval walks across boundaries as though all documents were a single
+stream, that is not necessarily the best possible evaluation method within the
+rules. A document-aware evaluator may give cleaner conditioning and a lower bpb.
+
+Why it is attractive
+
+- no extra model bytes
+- no training changes
+- fast to test relative to retraining
+
+Implementation sketch
+
+1. Inspect the validation shard format and confirm how document boundaries are
+   represented.
+2. Rework eval_val_sliding so it iterates over individual documents.
+3. Within each document, use the same sliding-window scoring logic.
+4. Reset context at each document boundary.
+5. Make sure scored bytes/tokens are counted exactly the same as before.
+
+Risks
+
+- boundary detection may be tricky if the shard format is not explicit
+- it may help less than it helped older, weaker models
+- if implemented incorrectly, it can produce an invalid metric
+
+Success criterion
+
+Any consistent gain larger than about 0.001 bpb is worth keeping. Anything above
+that is a strong sign this path is real.
+
+
+1B. Sweep evaluation stride and evaluation context again
+
+Goal
+
+Re-open the assumption that stride 64 with the current sequence length is best.
+
+Why it might win
+
+Older runs showed that evaluation settings can matter a lot. The best setting
+may depend on how well-trained the model is and how the RoPE setup behaves at
+evaluation time.
+
+What I would test
+
+- stride 32
+- stride 48
+- stride 64
+- stride 96
+- moderate longer-context evaluation, not necessarily 2x
+
+Important detail
+
+Do not assume that "more context is always better." One earlier README in this
+repo explicitly found that aggressive longer-context eval could become neutral or
+negative for well-trained models.
+
+Success criterion
+
+A stable gain that survives 2 to 3 reruns of eval on the same trained model.
+
+
+1C. Lightweight test-time adaptation
+
+Goal
+
+Adapt a tiny set of parameters during evaluation using only already-scored tokens
+from the same document.
+
+Why it might win
+
+This is still under-explored in the repo. The older LoRA TTT run was explicitly
+described as not heavily optimized. That means there may still be headroom.
+
+What I would change
+
+- keep the base model frozen
+- add small LoRA adapters or a similarly cheap adaptation path
+- adapt only on the current document
+- reset between documents
+- train only after scoring the chunk so there is no leakage
+
+Where I would start
+
+- lm_head / tied output path
+- q projection
+- v projection
+
+Constraints
+
+Evaluation must still stay under the 10-minute eval budget on 8xH100. So this
+must be very lightweight.
+
+What I would not do
+
+- full-model TTT
+- large-rank LoRAs
+- many optimization steps per chunk
+
+Success criterion
+
+Even a small additional gain after document-aware sliding could be enough if it
+costs zero artifact bytes.
+
+
+Phase 2: Better quantization and export
+
+Why this is the second major opening
+
+The best record already uses mixed int5/int6, which is strong. But the current
+quantization rule is still pretty simple: it mostly uses per-row max-abs scaling.
+
+That is usually not optimal at 5 bits.
+
+One outlier value can set the scale for the whole row and waste much of the
+available codebook. At low precision, that hurts both quality and compression.
+
+
+2A. Replace max-abs row scaling with percentile-clipped row scaling
+
+Current behavior
+
+The SOTA code computes row scales from row_max / clip_range for mixed int5/int6.
+
+Why that may be suboptimal
+
+Max-abs is dominated by outliers. Percentile clipping often gives a better trade:
+slightly clip rare extremes so the common values are represented more accurately.
+
+What I would test
+
+- 99.9 percentile per row
+- 99.5 percentile per row
+- maybe category-specific clipping:
+  - attention more conservative
+  - MLP more aggressive
+
+Why this is promising
+
+The current code already uses percentile clipping for some int8 tensors, so the
+idea is consistent with what the repo already does elsewhere.
+
+Success criterion
+
+Either:
+- the quantized roundtrip score gets better at the same bytes
+or
+- the bytes get smaller at the same score
+
+Both are useful.
+
+
+2B. Mixed precision by layer, not only by category
+
+Current behavior
+
+The top record mostly uses:
+- int5 for MLP
+- int6 for attention
+- fp16 for a few special tensors
+
+Why I think there is still headroom
+
+Not all layers are equally sensitive. Late layers are often more fragile than
+middle layers. Some projections matter more than others.
+
+What I would test
+
+- early MLP rows at int4/int5
+- mid-layer MLP at int5
+- late attention at int6
+- especially fragile final-layer projections in fp16
+- maybe only selected attention matrices in int6 and others in int5
+
+This can go in either direction:
+
+- save bytes and spend them on more model
+- keep bytes constant and improve roundtrip score
+
+The key point is that bit allocation should probably be based on sensitivity, not
+just tensor type.
+
+
+2C. Outlier-aware export
+
+Goal
+
+Keep only the hardest rows or channels in fp16 and quantize the rest aggressively.
+
+Why it might work
+
+A small number of outlier rows can dominate quantization error. If only a tiny
+fraction of rows are responsible for most of the damage, then protecting those
+rows can be more efficient than using a safer format for the whole tensor.
+
+Possible design
+
+For each 2D tensor:
+
+1. compute a sensitivity or outlier score per row
+2. keep the top K most sensitive rows in fp16
+3. quantize the remaining rows to int5 or int6
+4. store a compact row index list
+
+Tradeoff
+
+This increases code complexity and metadata overhead, so it needs to pay for
+itself. I would prototype this only after simpler clipping sweeps.
+
+
+2D. Groupwise scales instead of one scale per row
+
+Idea
+
+Instead of one scale for a whole row, split the row into groups and scale each
+group independently.
+
+Why it might help
+
+Local variation within a row can be large. Groupwise scales often improve low-bit
+ fidelity without moving all the way to a much higher bit-width.
+
+Risk
+
+More metadata may hurt compression. This is only worth it if the quantized values
+compress much better or the resulting score is meaningfully lower.
+
+
+2E. Improve pruning
+
+Current behavior
+
+The top record applies a simple 3 percent magnitude prune before export.
+
+Why this may be improvable
+
+Uniform global-ish pruning is blunt. Different layers and tensor types likely
+have different prune tolerances.
+
+What I would test
+
+- prune only MLP weights
+- prune only early or middle MLPs
+- per-layer prune thresholds
+- prune before SWA versus after SWA
+- prune-aware bit allocation
+
+Best-case outcome
+
+Lower bytes with near-zero quality loss, which can fund a stronger model.
+
+
+Phase 3: Spend saved bytes on more capacity
+
+This phase only makes sense after Phase 2 produces either:
+
+- smaller artifacts at equal score
+or
+- same artifact size with a lower roundtrip loss
+
+
+3A. Try 11 layers with the current best ideas
+
+Why this is the most obvious capacity bet
+
+There is already an 11-layer record in this repo that got close to the top, but
+it did not fully stack all the tricks used by the current best record.
+
+That means there is an obvious hybrid candidate:
+
+11 layers
++ SmearGate
++ BigramHash(10240)
++ orthogonal init
++ Muon WD=0.04
++ late SWA
++ improved mixed export
+
+This is probably the cleanest "go bigger" attempt.
+
+What has to be true
+
+The export path must be good enough to fit under 16MB without giving back too
+much quality.
+
+
+3B. Keep 10 layers but strengthen the local feature path
+
+If 11 layers does not fit cleanly, I would try keeping 10 layers and spending the
+byte savings on one of these:
+
+- a slightly larger bigram feature path
+- a smarter bigram feature path
+- a very small trigram-hash path
+- a better projection/gating design for local n-gram signals
+
+Why this is plausible
+
+BigramHash already helped the best record. That means local lexical structure is
+valuable at this small scale. There may still be gains from representing it more
+efficiently.
+
+
+3C. Reallocate width inside the same parameter budget
+
+Instead of just adding layers, I would also try:
+
+- slightly narrower attention, wider MLP
+- different KV head counts
+- stronger bottom layers, lighter top layers
+
+In small models, uneven allocation can beat uniform design.
+
+
+Phase 4: Training tricks that specifically target post-quant performance
+
+The key lesson from the records is that raw fp16 quality is not enough. The model
+that wins is the model that survives the final roundtrip.
+
+
+4A. Late-stage QAT only
+
+I would not start with full-run QAT.
+
+Why not
+
+Earlier records note that QAT can cost step speed, and speed matters because
+training is capped at 10 minutes.
+
+What I would try instead
+
+Enable fake quantization only for the last 10 to 25 percent of training.
+
+This may give the model a chance to adapt to the final export noise without
+paying the full runtime overhead across the whole run.
+
+Target
+
+Use fake quantization only on the tensors that will be aggressively quantized:
+
+- MLP
+- attention projections
+- maybe bigram projection if quantized
+
+
+4B. SWA variants chosen for quantized score, not fp32 score
+
+Current best already uses SWA over late checkpoints. I would still re-open this,
+but with a different objective.
+
+Important point
+
+Do not pick SWA settings that only improve pre-quant quality. Pick settings that
+improve post-quant bpb after the actual roundtrip.
+
+What I would sweep
+
+- swa_every
+- swa_start_frac
+- weighted SWA favoring later checkpoints more strongly
+
+There may be a setting that makes weights smoother and more quantization-friendly.
+
+
+4C. Quantization-friendly regularization
+
+Candidates
+
+- slightly stronger or tensor-specific weight decay
+- row-norm penalties on aggressively quantized matrices
+- small penalties on outlier rows
+
+Why this might work
+
+Quantization error is strongly tied to weight distribution shape. Smoother and
+tighter distributions often quantize better.
+
+This idea is only worth trying if it does not noticeably slow training.
+
+
+Ideas I would de-prioritize at the start
+
+These are not impossible, but I would not spend my first experiments here:
+
+1. SwiGLU
+   Earlier notes in the repo suggest it improved per-step quality but lost on
+   wallclock because it was slower.
+
+2. Huge tokenizer changes
+   Very high verification burden, more room for mistakes, and not the fastest
+   way to learn.
+
+3. Large architectural rewrites
+   Examples:
+   - recurrent depth loops
+   - state-space replacements
+   - retrieval-like mechanisms
+   These might work, but they are harder to stabilize quickly.
+
+4. Over-optimizing root train_gpt.py first
+   The best work in this challenge lives in /records. I would prototype serious
+   SOTA attempts there, then port simplified ideas back later if needed.
+
+
+The exact files I would work in first
+
+If the goal is to actually chase SOTA, I would start here:
+
+records/track_10min_16mb/2026-03-20_10L_Int5MLP_MuonWD04_SWA50/train_gpt.py
+
+The highest-value functions to edit first are:
+
+- eval_val_sliding
+- quantize_intN_per_row
+- mixed_quantize_int6
+- the final export / roundtrip section in main
+
+If an idea proves itself there, then I would port the smallest clean version into:
+
+- train_gpt.py
+- maybe train_gpt_mlx.py for local iteration
+
+
+My concrete experiment order
+
+If I were running this like a serious project, I would use this order.
+
+
+Experiment 1: document-aware sliding eval
+
+Change
+
+- only evaluation code
+
+What to measure
+
+- final quantized val_bpb
+- eval runtime
+
+Decision rule
+
+- keep if there is a clear gain and runtime stays safely inside eval budget
+
+
+Experiment 2: quantization clipping sweep on one trained checkpoint
+
+Change
+
+- only export / roundtrip code
+
+What to measure
+
+- quantized val_bpb after roundtrip
+- compressed bytes
+
+Decision rule
+
+- keep any configuration on the Pareto frontier:
+  lower score at same bytes, or fewer bytes at same score
+
+
+Experiment 3: layer-sensitive bit allocation
+
+Change
+
+- export path only
+
+What to measure
+
+- same as Experiment 2
+
+Decision rule
+
+- keep only if it clearly dominates the current export scheme
+
+
+Experiment 4: combine best eval + best export, then retrain
+
+Change
+
+- evaluation + export
+
+What to measure
+
+- 2 to 3 seed mean
+
+Decision rule
+
+- if this gets close enough to SOTA, continue
+
+
+Experiment 5: spend recovered bytes on 11th layer
+
+Change
+
+- architecture + export
+
+What to measure
+
+- 2 to 3 seed mean
+- compressed bytes
+- step speed
+
+Decision rule
+
+- keep only if it remains competitive under the time budget
+
+
+Experiment 6: late-stage fake quantization
+
+Change
+
+- training + export
+
+What to measure
+
+- steps completed in 600s
+- pre-quant score
+- post-quant score
+
+Decision rule
+
+- only keep if the post-quant gain outweighs any slowdown
+
+
+How I would measure progress
+
+I would track four numbers every time:
+
+1. pre-quant val_bpb
+2. post-quant val_bpb
+3. quantization gap
+4. artifact bytes
+
+Why these four matter
+
+- pre-quant tells you whether the model itself improved
+- post-quant tells you whether the submission improved
+- quant gap tells you whether export is the problem
+- bytes tell you whether you can buy more model
+
+If pre-quant improves but post-quant does not, the export path is the bottleneck.
+If bytes fall but score does not improve, spend the bytes on more capacity.
+
+
+My strongest single recommendation
+
+If I had to choose only one place to spend effort first, it would be:
+
+document-aware evaluation plus a stronger export scheme
+
+Why
+
+- both are likely cheaper to test than retraining a new architecture
+- both can produce gains without adding artifact bytes
+- both compose naturally with later model-capacity changes
+
+
+My strongest high-upside combined bet
+
+If the first rounds go well, the most promising full attempt is probably:
+
+11-layer model
++ SmearGate
++ BigramHash(10240 or better)
++ current optimizer schedule
++ late SWA
++ improved mixed export with clipping / sensitivity-aware bit allocation
++ document-aware sliding eval
++ maybe very light TTT if runtime allows
+
+That combination is the most plausible path I see to a real, reproducible win.
+
+
+Short version
+
+Do not start by changing everything.
+
+Start with:
+
+1. better evaluation
+2. better quantization
+3. spend any saved bytes on more capacity
+
+That is the path most likely to produce a real SOTA attempt instead of random
+architectural churn.

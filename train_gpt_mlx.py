@@ -555,8 +555,20 @@ MX_DTYPE_FROM_NAME = {
 INT8_KEEP_FLOAT_MAX_NUMEL = 65_536
 INT8_KEEP_FLOAT_STORE_DTYPE = np.float16
 INT8_PER_ROW_SCALE_DTYPE = np.float16
-INT8_CLIP_PERCENTILE = 99.99984
-INT8_CLIP_Q = INT8_CLIP_PERCENTILE / 100.0
+INT8_CLIP_PERCENTILE = float(os.environ.get("INT8_CLIP_PERCENTILE", "99.99984"))
+INT8_CLIP_PERCENTILE_EMBED = float(os.environ.get("INT8_CLIP_PERCENTILE_EMBED", str(INT8_CLIP_PERCENTILE)))
+INT8_CLIP_PERCENTILE_MLP = float(os.environ.get("INT8_CLIP_PERCENTILE_MLP", str(INT8_CLIP_PERCENTILE)))
+INT8_CLIP_PERCENTILE_ATTN = float(os.environ.get("INT8_CLIP_PERCENTILE_ATTN", str(INT8_CLIP_PERCENTILE)))
+INT8_CLIP_PERCENTILE_BIGRAM = float(os.environ.get("INT8_CLIP_PERCENTILE_BIGRAM", str(INT8_CLIP_PERCENTILE)))
+INT8_CLIP_PERCENTILE_OTHER = float(os.environ.get("INT8_CLIP_PERCENTILE_OTHER", str(INT8_CLIP_PERCENTILE)))
+INT8_DEFAULT_CLIP_PERCENTILES = {
+    "default": INT8_CLIP_PERCENTILE,
+    "embed": INT8_CLIP_PERCENTILE_EMBED,
+    "mlp": INT8_CLIP_PERCENTILE_MLP,
+    "attn": INT8_CLIP_PERCENTILE_ATTN,
+    "bigram": INT8_CLIP_PERCENTILE_BIGRAM,
+    "other": INT8_CLIP_PERCENTILE_OTHER,
+}
 
 
 def _np_float32(arr: mx.array) -> np.ndarray:
@@ -572,25 +584,46 @@ def keep_float_array(name: str, arr: mx.array, passthrough_orig_dtypes: dict[str
     return np.ascontiguousarray(np.array(arr, copy=True))
 
 
-def quantize_float_array(arr: mx.array) -> tuple[np.ndarray, np.ndarray]:
+def classify_quant_tensor(name: str) -> str:
+    if "tok_emb" in name or "lm_head" in name:
+        return "embed"
+    if ".mlp." in name:
+        return "mlp"
+    if "bigram" in name:
+        return "bigram"
+    if ".attn." in name or (".proj." in name and ".mlp." not in name):
+        return "attn"
+    return "other"
+
+
+def clip_q_for_name(name: str, clip_percentiles: dict[str, float] | None = None) -> float:
+    config = INT8_DEFAULT_CLIP_PERCENTILES if clip_percentiles is None else clip_percentiles
+    pct = float(config.get(classify_quant_tensor(name), config.get("default", INT8_CLIP_PERCENTILE)))
+    return pct / 100.0
+
+
+def quantize_float_array(arr: mx.array, clip_q: float) -> tuple[np.ndarray, np.ndarray]:
     f32 = _np_float32(arr)
     if f32.ndim == 2:
         # Matrices get one scale per row, which usually tracks output-channel
         # ranges much better than a single tensor-wide scale.
-        clip_abs = np.quantile(np.abs(f32), INT8_CLIP_Q, axis=1) if f32.size else np.empty((f32.shape[0],), dtype=np.float32)
+        clip_abs = np.quantile(np.abs(f32), clip_q, axis=1) if f32.size else np.empty((f32.shape[0],), dtype=np.float32)
         clipped = np.clip(f32, -clip_abs[:, None], clip_abs[:, None])
         scale = np.maximum(clip_abs / 127.0, 1.0 / 127.0).astype(np.float32, copy=False)
         q = np.clip(np.round(clipped / scale[:, None]), -127, 127).astype(np.int8, copy=False)
         return np.ascontiguousarray(q), np.ascontiguousarray(scale.astype(INT8_PER_ROW_SCALE_DTYPE, copy=False))
 
     # Vectors / scalars use a simpler per-tensor scale.
-    clip_abs = float(np.quantile(np.abs(f32).reshape(-1), INT8_CLIP_Q)) if f32.size else 0.0
+    clip_abs = float(np.quantile(np.abs(f32).reshape(-1), clip_q)) if f32.size else 0.0
     scale = np.array(clip_abs / 127.0 if clip_abs > 0.0 else 1.0, dtype=np.float32)
     q = np.clip(np.round(np.clip(f32, -clip_abs, clip_abs) / scale), -127, 127).astype(np.int8, copy=False)
     return np.ascontiguousarray(q), scale
 
 
-def quantize_state_dict_int8(flat_state: dict[str, mx.array]) -> tuple[dict[str, object], dict[str, int]]:
+def quantize_state_dict_int8(
+    flat_state: dict[str, mx.array],
+    clip_percentiles: dict[str, float] | None = None,
+) -> tuple[dict[str, object], dict[str, int]]:
     quantized: dict[str, np.ndarray] = {}
     scales: dict[str, np.ndarray] = {}
     dtypes: dict[str, str] = {}
@@ -620,9 +653,12 @@ def quantize_state_dict_int8(flat_state: dict[str, mx.array]) -> tuple[dict[str,
             continue
 
         stats["num_float_tensors"] += 1
-        q, s = quantize_float_array(arr)
+        clip_q = clip_q_for_name(name, clip_percentiles=clip_percentiles)
+        q, s = quantize_float_array(arr, clip_q=clip_q)
         if s.ndim > 0:
-            qmeta[name] = {"scheme": "per_row", "axis": 0}
+            qmeta[name] = {"scheme": "per_row", "axis": 0, "clip_q": clip_q}
+        else:
+            qmeta[name] = {"scheme": "per_tensor", "clip_q": clip_q}
         quantized[name] = q
         scales[name] = s
         dtypes[name] = str(arr.dtype).split(".")[-1]

@@ -85,6 +85,8 @@ class Hyperparameters:
 
     eval_stride = int(os.environ.get("EVAL_STRIDE", 64))
     eval_batch_seqs = int(os.environ.get("EVAL_BATCH_SEQS", 32))
+    eval_doc_aware = bool(int(os.environ.get("EVAL_DOC_AWARE", "0")))
+    eval_include_next_bos = bool(int(os.environ.get("EVAL_INCLUDE_NEXT_BOS", "1")))
 
     bigram_vocab_size = int(os.environ.get("BIGRAM_VOCAB_SIZE", 10240))
     bigram_dim = int(os.environ.get("BIGRAM_DIM", 128))
@@ -212,6 +214,25 @@ def load_validation_tokens(pattern: str, seq_len: int) -> Tensor:
     return tokens[: usable + 1]
 
 
+def find_document_spans(all_tokens: Tensor, bos_token_id: int, include_next_bos: bool = True) -> list[tuple[int, int]]:
+    bos_positions = (all_tokens == bos_token_id).nonzero(as_tuple=True)[0]
+    if bos_positions.numel() == 0:
+        raise ValueError(f"Could not find BOS token id {bos_token_id} in validation tokens")
+    bos_list = bos_positions.tolist()
+    if bos_list[0] != 0:
+        raise ValueError(f"Expected validation stream to start with BOS token id {bos_token_id}, got offset {bos_list[0]}")
+    docs: list[tuple[int, int]] = []
+    for i, start in enumerate(bos_list):
+        end = bos_list[i + 1] if i + 1 < len(bos_list) else all_tokens.numel()
+        if include_next_bos and i + 1 < len(bos_list):
+            end += 1
+        length = end - start
+        if length < 2:
+            raise ValueError(f"Document starting at offset {start} is too short for evaluation")
+        docs.append((start, length))
+    return docs
+
+
 def eval_val(
     args: Hyperparameters,
     model: nn.Module,
@@ -298,6 +319,20 @@ INT8_KEEP_FLOAT_STORE_DTYPE = torch.float16
 INT8_PER_ROW_SCALE_DTYPE = torch.float16
 INT8_CLIP_PERCENTILE = 99.99984
 INT8_CLIP_Q = INT8_CLIP_PERCENTILE / 100.0
+LOWBIT_ROW_CLIP_PERCENTILE = float(os.environ.get("LOWBIT_ROW_CLIP_PERCENTILE", "100.0"))
+LOWBIT_ROW_CLIP_PERCENTILE_EMBED = float(os.environ.get("LOWBIT_ROW_CLIP_PERCENTILE_EMBED", str(LOWBIT_ROW_CLIP_PERCENTILE)))
+LOWBIT_ROW_CLIP_PERCENTILE_MLP = float(os.environ.get("LOWBIT_ROW_CLIP_PERCENTILE_MLP", str(LOWBIT_ROW_CLIP_PERCENTILE)))
+LOWBIT_ROW_CLIP_PERCENTILE_ATTN = float(os.environ.get("LOWBIT_ROW_CLIP_PERCENTILE_ATTN", str(LOWBIT_ROW_CLIP_PERCENTILE)))
+LOWBIT_ROW_CLIP_PERCENTILE_BIGRAM = float(os.environ.get("LOWBIT_ROW_CLIP_PERCENTILE_BIGRAM", str(LOWBIT_ROW_CLIP_PERCENTILE)))
+LOWBIT_ROW_CLIP_PERCENTILE_OTHER = float(os.environ.get("LOWBIT_ROW_CLIP_PERCENTILE_OTHER", str(LOWBIT_ROW_CLIP_PERCENTILE)))
+LOWBIT_DEFAULT_CLIP_PERCENTILES = {
+    "default": LOWBIT_ROW_CLIP_PERCENTILE,
+    "embed": LOWBIT_ROW_CLIP_PERCENTILE_EMBED,
+    "mlp": LOWBIT_ROW_CLIP_PERCENTILE_MLP,
+    "attn": LOWBIT_ROW_CLIP_PERCENTILE_ATTN,
+    "bigram": LOWBIT_ROW_CLIP_PERCENTILE_BIGRAM,
+    "other": LOWBIT_ROW_CLIP_PERCENTILE_OTHER,
+}
 
 def tensor_nbytes(t: Tensor) -> int:
     return int(t.numel()) * int(t.element_size())
@@ -331,20 +366,35 @@ def _classify_param(name: str) -> str:
         return "attn"
     return "other"
 
-def quantize_intN_per_row(t: Tensor, clip_range: int = 31) -> tuple[Tensor, Tensor]:
+def lowbit_row_clip_q_for_name(name: str, clip_percentiles: dict[str, float] | None = None) -> float:
+    config = LOWBIT_DEFAULT_CLIP_PERCENTILES if clip_percentiles is None else clip_percentiles
+    pct = float(config.get(_classify_param(name), config.get("default", LOWBIT_ROW_CLIP_PERCENTILE)))
+    if pct >= 100.0:
+        return 1.0
+    return max(pct / 100.0, 0.0)
+
+def quantize_intN_per_row(t: Tensor, clip_range: int = 31, clip_q: float = 1.0) -> tuple[Tensor, Tensor]:
     t32 = t.float()
     if t32.ndim == 2:
-        row_max = t32.abs().amax(dim=1)
-        scale = (row_max / clip_range).clamp_min(1e-12).to(torch.float16)
+        row_abs = t32.abs()
+        clip_abs = row_abs.amax(dim=1) if clip_q >= 1.0 else torch.quantile(row_abs, clip_q, dim=1)
+        clipped = torch.maximum(torch.minimum(t32, clip_abs[:, None]), -clip_abs[:, None])
+        scale = (clip_abs / clip_range).clamp_min(1e-12).to(torch.float16)
         scale = scale.clamp_min(torch.finfo(torch.float16).tiny)
-        q = torch.clamp(torch.round(t32 / scale.float()[:, None]), -(clip_range+1), clip_range).to(torch.int8)
+        q = torch.clamp(torch.round(clipped / scale.float()[:, None]), -(clip_range+1), clip_range).to(torch.int8)
         return q, scale
-    amax = t32.abs().max().item()
-    scale = torch.tensor(max(amax / clip_range, 1e-12), dtype=torch.float16)
-    q = torch.clamp(torch.round(t32 / scale.float()), -(clip_range+1), clip_range).to(torch.int8)
+    abs_flat = t32.abs().flatten()
+    clip_abs = float(torch.quantile(abs_flat, clip_q).item()) if (t32.numel() and clip_q < 1.0) else (abs_flat.max().item() if t32.numel() else 0.0)
+    clipped = torch.clamp(t32, -clip_abs, clip_abs) if clip_abs > 0.0 else t32
+    scale = torch.tensor(max(clip_abs / clip_range, 1e-12), dtype=torch.float16)
+    q = torch.clamp(torch.round(clipped / scale.float()), -(clip_range+1), clip_range).to(torch.int8)
     return q, scale
 
-def mixed_quantize_int6(state_dict: dict[str, Tensor], int6_cats: set[str]):
+def mixed_quantize_int6(
+    state_dict: dict[str, Tensor],
+    int6_cats: set[str],
+    clip_percentiles: dict[str, float] | None = None,
+):
     result: dict[str, Tensor] = {}
     meta: dict[str, object] = {}
     for name, tensor in state_dict.items():
@@ -364,10 +414,11 @@ def mixed_quantize_int6(state_dict: dict[str, Tensor], int6_cats: set[str]):
             continue
         if cat in int6_cats and t.ndim >= 1:
             clip = 15 if cat == "mlp" else 31  # int5 for MLP, int6 for attention
-            q, s = quantize_intN_per_row(t, clip_range=clip)
+            clip_q = lowbit_row_clip_q_for_name(name, clip_percentiles=clip_percentiles)
+            q, s = quantize_intN_per_row(t, clip_range=clip, clip_q=clip_q)
             result[name + ".q"] = q
             result[name + ".scale"] = s
-            meta[name] = {"type": f"int{5 if cat == 'mlp' else 6}"}
+            meta[name] = {"type": f"int{5 if cat == 'mlp' else 6}", "clip_q": clip_q}
         else:
             q, s = quantize_float_tensor(t)
             result[name + ".q"] = q
@@ -816,6 +867,114 @@ def eval_val_sliding(
     return val_loss, bits_per_token * tokens_per_byte
 
 
+def eval_val_sliding_doc_aware(
+    args: Hyperparameters,
+    base_model: nn.Module,
+    rank: int,
+    world_size: int,
+    device: torch.device,
+    val_tokens: Tensor,
+    base_bytes_lut: Tensor,
+    has_leading_space_lut: Tensor,
+    is_boundary_token_lut: Tensor,
+    bos_token_id: int,
+    stride: int,
+    batch_seqs: int = 32,
+    include_next_bos: bool = True,
+) -> tuple[float, float]:
+    seq_len = args.train_seq_len
+    docs = find_document_spans(val_tokens, bos_token_id, include_next_bos=include_next_bos)
+    windows: list[tuple[int, int, int, int, int]] = []
+    for doc_start, doc_len in docs:
+        pred_len = doc_len - 1
+        score_start = 0
+        score_end = min(seq_len, pred_len)
+        while score_start < pred_len:
+            ws = max(0, score_end - seq_len)
+            wlen = score_end - ws
+            score_offset = score_start - ws
+            score_len = score_end - score_start
+            windows.append((doc_start, ws, wlen, score_offset, score_len))
+            score_start = score_end
+            score_end = min(score_end + stride, pred_len)
+
+    total_windows = len(windows)
+    my_s = (total_windows * rank) // world_size
+    my_e = (total_windows * (rank + 1)) // world_size
+    my_windows = windows[my_s:my_e]
+
+    loss_sum = torch.zeros((), device=device, dtype=torch.float64)
+    token_count = torch.zeros((), device=device, dtype=torch.float64)
+    byte_count = torch.zeros((), device=device, dtype=torch.float64)
+
+    base_model.eval()
+    with torch.inference_mode():
+        for bi in range(0, len(my_windows), batch_seqs):
+            batch_windows = my_windows[bi:bi + batch_seqs]
+            bsz = len(batch_windows)
+            x_batch = torch.zeros(bsz, seq_len, dtype=torch.int64, device=device)
+            y_batch = torch.zeros(bsz, seq_len, dtype=torch.int64, device=device)
+            wlens: list[int] = []
+            score_starts: list[int] = []
+            score_lens: list[int] = []
+            for i, (doc_start, ws, wlen, score_offset, score_len) in enumerate(batch_windows):
+                end = ws + wlen
+                wlens.append(wlen)
+                score_starts.append(score_offset)
+                score_lens.append(score_len)
+                chunk = val_tokens[doc_start + ws : doc_start + end + 1].to(dtype=torch.int64, device=device)
+                x_batch[i, :wlen] = chunk[:-1]
+                y_batch[i, :wlen] = chunk[1:]
+            with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
+                logits = base_model.forward_logits(x_batch)
+            nll = F.cross_entropy(
+                logits.reshape(-1, logits.size(-1)).float(),
+                y_batch.reshape(-1),
+                reduction="none",
+            ).reshape(bsz, seq_len)
+            for i in range(bsz):
+                s = score_starts[i]
+                e = s + score_lens[i]
+                scored_nll = nll[i, s:e].to(torch.float64)
+                loss_sum += scored_nll.sum()
+                token_count += float(score_lens[i])
+                tgt = y_batch[i, s:e]
+                prev = x_batch[i, s:e]
+                tb = base_bytes_lut[tgt].to(torch.float64)
+                tb += (has_leading_space_lut[tgt] & ~is_boundary_token_lut[prev]).to(torch.float64)
+                byte_count += tb.sum()
+            if rank == 0 and (bi // batch_seqs) % 50 == 0:
+                done = min(bi + batch_seqs, len(my_windows))
+                pct = done / max(len(my_windows), 1) * 100
+                running_bpb = 0.0
+                if token_count.item() > 0 and byte_count.item() > 0:
+                    rl = (loss_sum / token_count).item()
+                    running_bpb = rl / math.log(2.0) * (token_count.item() / byte_count.item())
+                print(
+                    f"  doc_sliding_eval [{pct:5.1f}%] {done}/{len(my_windows)} windows "
+                    f"docs={len(docs)} running_bpb={running_bpb:.6f}",
+                    flush=True,
+                )
+
+    if dist.is_available() and dist.is_initialized():
+        dist.all_reduce(loss_sum, op=dist.ReduceOp.SUM)
+        dist.all_reduce(token_count, op=dist.ReduceOp.SUM)
+        dist.all_reduce(byte_count, op=dist.ReduceOp.SUM)
+
+    expected_token_count = float(val_tokens.numel() - 1)
+    if abs(token_count.item() - expected_token_count) > 0.5:
+        raise RuntimeError(
+            f"Document-aware sliding eval scored {token_count.item():.0f} tokens, "
+            f"expected {expected_token_count:.0f}"
+        )
+
+    val_loss = (loss_sum / token_count).item()
+    bits_per_token = val_loss / math.log(2.0)
+    tokens_per_byte = token_count.item() / byte_count.item()
+    base_model.train()
+    return val_loss, bits_per_token * tokens_per_byte
+
+
 # -----------------------------
 # TRAINING
 # -----------------------------
@@ -891,6 +1050,9 @@ def main() -> None:
         raise ValueError(
             f"VOCAB_SIZE={args.vocab_size} does not match tokenizer vocab_size={int(sp.vocab_size())}"
         )
+    bos_token_id = int(sp.bos_id())
+    if bos_token_id < 0:
+        raise ValueError("SentencePiece tokenizer must define a BOS token for document-aware evaluation")
     dataset_dir = Path(args.data_path).resolve()
     actual_train_files = len(list(dataset_dir.glob("fineweb_train_*.bin")))
     val_tokens = load_validation_tokens(args.val_files, args.train_seq_len)
@@ -900,6 +1062,10 @@ def main() -> None:
     log0(f"val_bpb:enabled tokenizer_kind=sentencepiece tokenizer_path={args.tokenizer_path}")
     log0(f"train_loader:dataset:{dataset_dir.name} train_shards:{actual_train_files}")
     log0(f"val_loader:shards pattern={args.val_files} tokens:{val_tokens.numel() - 1}")
+    log0(
+        f"eval_config:stride:{args.eval_stride} batch_seqs:{args.eval_batch_seqs} "
+        f"doc_aware:{args.eval_doc_aware} include_next_bos:{args.eval_include_next_bos}"
+    )
 
     # MODEL + OPTIMIZER SETUP
     base_model = GPT(
@@ -1170,6 +1336,15 @@ def main() -> None:
 
     # INT6 mixed quantization + zstd/zlib export
     sd_cpu = {k: v.detach().cpu() for k, v in base_model.state_dict().items()}
+    log0(
+        "lowbit_row_clip_percentiles "
+        f"default:{LOWBIT_DEFAULT_CLIP_PERCENTILES['default']:.5f} "
+        f"embed:{LOWBIT_DEFAULT_CLIP_PERCENTILES['embed']:.5f} "
+        f"mlp:{LOWBIT_DEFAULT_CLIP_PERCENTILES['mlp']:.5f} "
+        f"attn:{LOWBIT_DEFAULT_CLIP_PERCENTILES['attn']:.5f} "
+        f"bigram:{LOWBIT_DEFAULT_CLIP_PERCENTILES['bigram']:.5f} "
+        f"other:{LOWBIT_DEFAULT_CLIP_PERCENTILES['other']:.5f}"
+    )
     quant_result, quant_meta = mixed_quantize_int6(sd_cpu, {"mlp", "attn", "bigram"})
     quant_buf = io.BytesIO()
     torch.save({"w": quant_result, "m": quant_meta}, quant_buf)
@@ -1202,12 +1377,26 @@ def main() -> None:
     torch.cuda.synchronize()
     t_qeval = time.perf_counter()
     if args.eval_stride > 0 and args.eval_stride < args.train_seq_len:
-        log0(f"final_eval_mode:sliding_window stride:{args.eval_stride} batch_seqs:{args.eval_batch_seqs}")
-        q_val_loss, q_val_bpb = eval_val_sliding(
-            args, base_model, rank, world_size, device,
-            val_tokens, base_bytes_lut, has_leading_space_lut, is_boundary_token_lut,
-            stride=args.eval_stride, batch_seqs=args.eval_batch_seqs,
-        )
+        if args.eval_doc_aware:
+            log0(
+                f"final_eval_mode:doc_aware_sliding_window stride:{args.eval_stride} "
+                f"batch_seqs:{args.eval_batch_seqs} include_next_bos:{args.eval_include_next_bos}"
+            )
+            q_val_loss, q_val_bpb = eval_val_sliding_doc_aware(
+                args, base_model, rank, world_size, device,
+                val_tokens, base_bytes_lut, has_leading_space_lut, is_boundary_token_lut,
+                bos_token_id=bos_token_id,
+                stride=args.eval_stride,
+                batch_seqs=args.eval_batch_seqs,
+                include_next_bos=args.eval_include_next_bos,
+            )
+        else:
+            log0(f"final_eval_mode:sliding_window stride:{args.eval_stride} batch_seqs:{args.eval_batch_seqs}")
+            q_val_loss, q_val_bpb = eval_val_sliding(
+                args, base_model, rank, world_size, device,
+                val_tokens, base_bytes_lut, has_leading_space_lut, is_boundary_token_lut,
+                stride=args.eval_stride, batch_seqs=args.eval_batch_seqs,
+            )
     else:
         log0("final_eval_mode:standard")
         q_val_loss, q_val_bpb = eval_val(
